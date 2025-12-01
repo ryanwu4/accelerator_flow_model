@@ -1,4 +1,7 @@
 import numpy as np
+import os
+#enable mps fallback
+os.environ["PYTORCH_ENABLE_MPS_FALLBACK"] = "1"
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -23,7 +26,7 @@ warnings.filterwarnings('ignore')
 
 class Config:
     # File paths
-    DATA_DIR = "particle_data"
+    DATA_DIR = "../particle_data"
     MODEL_SAVE_PATH = "conditional_flow_model.pt"
     SCALER_SAVE_PATH = "conditional_flow_scalers.pkl"
     
@@ -52,9 +55,9 @@ class Config:
     CONDITION_DIM = 45  # 6 mean + 6 std + 21 cov + 6 skew + 6 kurt
     
     # Loss weights
-    WEIGHT_EMITTANCE_2D = 0.0
-    WEIGHT_EMITTANCE_4D = 0.0
-    WEIGHT_EMITTANCE_6D = 0.0
+    WEIGHT_EMITTANCE_2D = 1.0
+    WEIGHT_EMITTANCE_4D = 0.5
+    WEIGHT_EMITTANCE_6D = 0.1
     
     # Validation
     N_SW_PROJECTIONS = 100
@@ -766,8 +769,12 @@ def train_model(config, device):
         optimizer, mode='min', factor=0.5, patience=10
     )
     
-    train_losses = []
-    test_losses = []
+    # History storage
+    history = {
+        'train': {'total': [], 'nll': [], 'emit_2d': [], 'emit_4d': [], 'emit_6d': []},
+        'test': {'total': [], 'nll': [], 'emit_2d': [], 'emit_4d': [], 'emit_6d': []}
+    }
+    
     best_test_loss = float('inf')
     best_epoch = 0
     best_model_state = None
@@ -776,7 +783,7 @@ def train_model(config, device):
     print("TRAINING CONFIGURATION")
     print("="*80)
     print(f"Epochs: {config.N_EPOCHS} | Batch: {config.BATCH_SIZE} | LR: {config.LEARNING_RATE}")
-    print(f"Loss: Negative Log-Likelihood")
+    print(f"Loss: Negative Log-Likelihood + Emittance Terms")
     print(f"Train: {len(train_loader)} batches | Test: {len(test_loader)} batches")
     print("="*80)
     print("\nStarting training...\n")
@@ -785,7 +792,8 @@ def train_model(config, device):
     for epoch in range(config.N_EPOCHS):
         # Training phase
         flow_model.train()
-        train_loss_epoch = 0.0
+        
+        epoch_losses = {'total': 0.0, 'nll': 0.0, 'emit_2d': 0.0, 'emit_4d': 0.0, 'emit_6d': 0.0}
         
         for final_batch, cond_batch in train_loader:
             final_batch = final_batch.to(device)
@@ -809,16 +817,12 @@ def train_model(config, device):
             # Emittance Loss
             # ----------------------------------------------------------------
             loss_emittance = 0.0
+            l2d_val = 0.0
+            l4d_val = 0.0
+            l6d_val = 0.0
+            
             if config.WEIGHT_EMITTANCE_2D > 0 or config.WEIGHT_EMITTANCE_4D > 0 or config.WEIGHT_EMITTANCE_6D > 0:
                 # Generate samples for emittance calculation
-                # We need to sample from the model using the same conditions
-                # cond_flat is (Batch * N, 45)
-                # We want to generate x_pred matching final_flat structure
-                
-                # Note: flow_model.sample uses torch.randn which is stochastic.
-                # We want gradients to flow through the generated samples to the model parameters.
-                # The reparameterization trick is implicit in the flow transformation (z -> x).
-                
                 x_pred_flat = flow_model.sample(final_flat.size(0), cond_flat)
                 
                 # Reshape to (Batch, N, 6) for emittance calculation
@@ -826,28 +830,28 @@ def train_model(config, device):
                 x_true = final_batch  # Already (Batch, N, 6) and normalized
                 
                 # Compute emittances (on normalized data)
-                # This keeps the loss magnitude reasonable (O(1))
                 em_pred = compute_emittance_torch(x_pred)
                 em_true = compute_emittance_torch(x_true)
                 
                 if config.WEIGHT_EMITTANCE_2D > 0:
-                    # Percent error: |pred - true| / true
-                    # Add epsilon to denominator for stability
                     eps = 1e-20
                     l2d = (torch.abs((em_pred['x_xp'] - em_true['x_xp']) / (em_true['x_xp'] + eps)).mean() +
                            torch.abs((em_pred['y_yp'] - em_true['y_yp']) / (em_true['y_yp'] + eps)).mean() +
                            torch.abs((em_pred['z_delta'] - em_true['z_delta']) / (em_true['z_delta'] + eps)).mean()) / 3.0
                     loss_emittance += config.WEIGHT_EMITTANCE_2D * l2d
+                    l2d_val = l2d.item()
                     
                 if config.WEIGHT_EMITTANCE_4D > 0:
                     eps = 1e-20
                     l4d = torch.abs((em_pred['fourd'] - em_true['fourd']) / (em_true['fourd'] + eps)).mean()
                     loss_emittance += config.WEIGHT_EMITTANCE_4D * l4d
+                    l4d_val = l4d.item()
                     
                 if config.WEIGHT_EMITTANCE_6D > 0:
                     eps = 1e-20
                     l6d = torch.abs((em_pred['sixd'] - em_true['sixd']) / (em_true['sixd'] + eps)).mean()
                     loss_emittance += config.WEIGHT_EMITTANCE_6D * l6d
+                    l6d_val = l6d.item()
             
             loss = nll_loss + loss_emittance
             
@@ -856,13 +860,23 @@ def train_model(config, device):
             torch.nn.utils.clip_grad_norm_(flow_model.parameters(), max_norm=1.0)
             optimizer.step()
             
-            train_loss_epoch += loss.item() * batch_size
+            # Accumulate losses
+            epoch_losses['total'] += loss.item() * batch_size
+            epoch_losses['nll'] += nll_loss.item() * batch_size
+            epoch_losses['emit_2d'] += l2d_val * batch_size
+            epoch_losses['emit_4d'] += l4d_val * batch_size
+            epoch_losses['emit_6d'] += l6d_val * batch_size
         
-        train_loss_epoch /= len(train_dataset)
+        # Average over dataset
+        for k in epoch_losses:
+            epoch_losses[k] /= len(train_dataset)
+            history['train'][k].append(epoch_losses[k])
+        
+        train_loss_epoch = epoch_losses['total']
         
         # Evaluation phase
         flow_model.eval()
-        test_loss_epoch = 0.0
+        test_epoch_losses = {'total': 0.0, 'nll': 0.0, 'emit_2d': 0.0, 'emit_4d': 0.0, 'emit_6d': 0.0}
         
         with torch.no_grad():
             for final_batch, cond_batch in test_loader:
@@ -877,15 +891,57 @@ def train_model(config, device):
                 cond_flat = cond_expanded.reshape(batch_size * n_particles, -1)
                 
                 log_prob = flow_model.log_prob(final_flat, cond_flat)
-                loss = -log_prob.mean() / 6.0
-                test_loss_epoch += loss.item() * batch_size
+                nll_loss = -log_prob.mean() / 6.0
+                
+                # Emittance loss for validation
+                loss_emittance = 0.0
+                l2d_val = 0.0
+                l4d_val = 0.0
+                l6d_val = 0.0
+                
+                if config.WEIGHT_EMITTANCE_2D > 0 or config.WEIGHT_EMITTANCE_4D > 0 or config.WEIGHT_EMITTANCE_6D > 0:
+                    x_pred_flat = flow_model.sample(final_flat.size(0), cond_flat)
+                    x_pred = x_pred_flat.reshape(batch_size, n_particles, 6)
+                    x_true = final_batch
+                    
+                    em_pred = compute_emittance_torch(x_pred)
+                    em_true = compute_emittance_torch(x_true)
+                    
+                    if config.WEIGHT_EMITTANCE_2D > 0:
+                        eps = 1e-20
+                        l2d = (torch.abs((em_pred['x_xp'] - em_true['x_xp']) / (em_true['x_xp'] + eps)).mean() +
+                               torch.abs((em_pred['y_yp'] - em_true['y_yp']) / (em_true['y_yp'] + eps)).mean() +
+                               torch.abs((em_pred['z_delta'] - em_true['z_delta']) / (em_true['z_delta'] + eps)).mean()) / 3.0
+                        loss_emittance += config.WEIGHT_EMITTANCE_2D * l2d
+                        l2d_val = l2d.item()
+                        
+                    if config.WEIGHT_EMITTANCE_4D > 0:
+                        eps = 1e-20
+                        l4d = torch.abs((em_pred['fourd'] - em_true['fourd']) / (em_true['fourd'] + eps)).mean()
+                        loss_emittance += config.WEIGHT_EMITTANCE_4D * l4d
+                        l4d_val = l4d.item()
+                        
+                    if config.WEIGHT_EMITTANCE_6D > 0:
+                        eps = 1e-20
+                        l6d = torch.abs((em_pred['sixd'] - em_true['sixd']) / (em_true['sixd'] + eps)).mean()
+                        loss_emittance += config.WEIGHT_EMITTANCE_6D * l6d
+                        l6d_val = l6d.item()
+                
+                loss = nll_loss + loss_emittance
+                
+                test_epoch_losses['total'] += loss.item() * batch_size
+                test_epoch_losses['nll'] += nll_loss.item() * batch_size
+                test_epoch_losses['emit_2d'] += l2d_val * batch_size
+                test_epoch_losses['emit_4d'] += l4d_val * batch_size
+                test_epoch_losses['emit_6d'] += l6d_val * batch_size
         
-        test_loss_epoch /= len(test_dataset)
+        for k in test_epoch_losses:
+            test_epoch_losses[k] /= len(test_dataset)
+            history['test'][k].append(test_epoch_losses[k])
+        
+        test_loss_epoch = test_epoch_losses['total']
         
         scheduler.step(test_loss_epoch)
-        
-        train_losses.append(train_loss_epoch)
-        test_losses.append(test_loss_epoch)
         
         # Save best model
         if test_loss_epoch < best_test_loss:
@@ -901,7 +957,8 @@ def train_model(config, device):
                     'optimizer_state_dict': optimizer.state_dict(),
                     'train_loss': train_loss_epoch,
                     'test_loss': test_loss_epoch,
-                    'best_test_loss': best_test_loss
+                    'best_test_loss': best_test_loss,
+                    'history': history
                 }, checkpoint_path)
         
         current_lr = optimizer.param_groups[0]['lr']
@@ -916,21 +973,21 @@ def train_model(config, device):
     print("TRAINING COMPLETE")
     print("="*80)
     print(f"Best test loss:     {best_test_loss:.4f}  (epoch {best_epoch})")
-    print(f"Final train loss:   {train_losses[-1]:.4f}")
-    print(f"Final test loss:    {test_losses[-1]:.4f}")
+    print(f"Final train loss:   {history['train']['total'][-1]:.4f}")
+    print(f"Final test loss:    {history['test']['total'][-1]:.4f}")
     
     # Load best model
     flow_model.load_state_dict(best_model_state)
     print(f"\n✓ Loaded best model from epoch {best_epoch}")
     
     # Plot training history
-    plot_training_history(train_losses, test_losses, best_test_loss, best_epoch)
+    plot_training_history(history, best_test_loss, best_epoch)
     
     # Evaluate model
     evaluate_model(flow_model, test_dataset, scaler_final, scaler_condition, config, device)
     
     # Save model
-    save_model(flow_model, scaler_final, scaler_condition, train_losses, test_losses, 
+    save_model(flow_model, scaler_final, scaler_condition, history, 
               best_test_loss, best_epoch, pt_files, train_dataset, test_dataset, config)
     
     return flow_model, scaler_final, scaler_condition
@@ -940,26 +997,39 @@ def train_model(config, device):
 # VISUALIZATION
 # ============================================================================
 
-def plot_training_history(train_losses, test_losses, best_test_loss, best_epoch):
-    """Plot and save training history."""
-    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+def plot_training_history(history, best_test_loss, best_epoch):
+    """Plot and save training history with breakdown of loss terms."""
+    fig, axes = plt.subplots(1, 2, figsize=(16, 6))
     
-    # Full training history
-    axes[0].plot(train_losses, alpha=0.7, label='Train Loss', linewidth=2)
-    axes[0].plot(test_losses, alpha=0.7, label='Test Loss', linewidth=2)
+    # Extract total losses
+    train_total = history['train']['total']
+    test_total = history['test']['total']
+    
+    # Plot 1: Total Loss
+    axes[0].plot(train_total, alpha=0.7, label='Train Total', linewidth=2, color='blue')
+    axes[0].plot(test_total, alpha=0.7, label='Test Total', linewidth=2, color='orange')
+    axes[0].axvline(x=best_epoch-1, color='green', linestyle='--', alpha=0.5, label=f'Best Epoch ({best_epoch})')
     axes[0].set_xlabel('Epoch', fontsize=12)
-    axes[0].set_ylabel('Negative Log-Likelihood', fontsize=12)
-    axes[0].set_title('Training History (Full)', fontsize=14, fontweight='bold')
+    axes[0].set_ylabel('Loss', fontsize=12)
+    axes[0].set_title('Total Loss History', fontsize=14, fontweight='bold')
     axes[0].legend()
     axes[0].grid(True, alpha=0.3)
     
-    # Last 50 epochs for detail
-    n_detail = min(50, len(train_losses))
-    axes[1].plot(train_losses[-n_detail:], alpha=0.7, label='Train Loss', linewidth=2)
-    axes[1].plot(test_losses[-n_detail:], alpha=0.7, label='Test Loss', linewidth=2)
-    axes[1].set_xlabel(f'Epoch (last {n_detail})', fontsize=12)
-    axes[1].set_ylabel('Negative Log-Likelihood', fontsize=12)
-    axes[1].set_title('Training History (Detail)', fontsize=14, fontweight='bold')
+    # Plot 2: Loss Breakdown (Train)
+    # Plot NLL and weighted emittance terms
+    epochs = range(len(train_total))
+    axes[1].plot(epochs, history['train']['nll'], alpha=0.7, label='NLL', linewidth=2)
+    
+    if any(v > 0 for v in history['train']['emit_2d']):
+        axes[1].plot(epochs, history['train']['emit_2d'], alpha=0.6, label='Emit 2D (weighted)', linestyle='--')
+    if any(v > 0 for v in history['train']['emit_4d']):
+        axes[1].plot(epochs, history['train']['emit_4d'], alpha=0.6, label='Emit 4D (weighted)', linestyle='--')
+    if any(v > 0 for v in history['train']['emit_6d']):
+        axes[1].plot(epochs, history['train']['emit_6d'], alpha=0.6, label='Emit 6D (weighted)', linestyle='--')
+        
+    axes[1].set_xlabel('Epoch', fontsize=12)
+    axes[1].set_ylabel('Loss Component', fontsize=12)
+    axes[1].set_title('Training Loss Breakdown', fontsize=14, fontweight='bold')
     axes[1].legend()
     axes[1].grid(True, alpha=0.3)
     
@@ -1111,7 +1181,7 @@ def plot_evaluation_results(result, idx):
     ax22.legend()
     ax22.grid(True, alpha=0.3)
     
-    plt.suptitle(f'Conditional Flow: Predicted vs True Distribution (Sample {idx})\nSW Distance: {result["sw_pred"]:.4e}', 
+    plt.suptitle(f'Conditional Flow: Predicted vs True Distribution (Sample {idx})\nSW Distance: {result["sw_pred"]:.4e} | 6D Emit Err: {result["err_6d"]:.1f}%', 
                  fontsize=16, fontweight='bold', y=0.995)
     
     plt.tight_layout()
@@ -1204,13 +1274,34 @@ def evaluate_model(flow_model, test_dataset, scaler_final, scaler_condition, con
                     final_pred, final_true_denorm, config.N_SW_PROJECTIONS
                 )
                 
+                # Compute Emittance Errors (Percent)
+                # Need to reshape for compute_emittance_torch: (1, N, 6)
+                x_pred_tensor = torch.FloatTensor(final_pred).unsqueeze(0)
+                x_true_tensor = torch.FloatTensor(final_true_denorm).unsqueeze(0)
+                
+                em_pred = compute_emittance_torch(x_pred_tensor)
+                em_true = compute_emittance_torch(x_true_tensor)
+                
+                # Calculate percent errors
+                eps = 1e-20
+                err_2d_x = torch.abs((em_pred['x_xp'] - em_true['x_xp']) / (em_true['x_xp'] + eps)).item() * 100
+                err_2d_y = torch.abs((em_pred['y_yp'] - em_true['y_yp']) / (em_true['y_yp'] + eps)).item() * 100
+                err_2d_z = torch.abs((em_pred['z_delta'] - em_true['z_delta']) / (em_true['z_delta'] + eps)).item() * 100
+                err_4d = torch.abs((em_pred['fourd'] - em_true['fourd']) / (em_true['fourd'] + eps)).item() * 100
+                err_6d = torch.abs((em_pred['sixd'] - em_true['sixd']) / (em_true['sixd'] + eps)).item() * 100
+                
                 test_results.append({
                     'true': final_true_denorm,
                     'pred': final_pred,
-                    'sw_pred': sw_pred_vs_true
+                    'sw_pred': sw_pred_vs_true,
+                    'err_2d_x': err_2d_x,
+                    'err_2d_y': err_2d_y,
+                    'err_2d_z': err_2d_z,
+                    'err_4d': err_4d,
+                    'err_6d': err_6d
                 })
                 
-                print(f"  SW(pred, true): {sw_pred_vs_true:.4e}")
+                print(f"  SW: {sw_pred_vs_true:.4e} | Err 6D: {err_6d:.2f}% | Err 4D: {err_4d:.2f}%")
                 
                 # Plot results
                 plot_evaluation_results(test_results[-1], i)
@@ -1224,15 +1315,24 @@ def evaluate_model(flow_model, test_dataset, scaler_final, scaler_condition, con
     # Summary statistics
     if len(test_results) > 0:
         sw_preds = [r['sw_pred'] for r in test_results]
+        err_6d = [r['err_6d'] for r in test_results]
+        err_4d = [r['err_4d'] for r in test_results]
         
         print("\n" + "="*80)
         print("EVALUATION SUMMARY")
         print("="*80)
         print(f"Successfully evaluated: {len(test_results)}/{n_eval} samples")
-        print(f"Average SW(predicted, true):  {np.mean(sw_preds):.4e}")
-        print(f"Std SW(predicted, true):      {np.std(sw_preds):.4e}")
-        print(f"Min SW(predicted, true):      {np.min(sw_preds):.4e}")
-        print(f"Max SW(predicted, true):      {np.max(sw_preds):.4e}")
+        print(f"Average SW Distance:      {np.mean(sw_preds):.4e}")
+        print(f"Average 6D Emittance Err: {np.mean(err_6d):.2f}%")
+        print(f"Average 4D Emittance Err: {np.mean(err_4d):.2f}%")
+        
+        # Detailed breakdown
+        print("\nDetailed Emittance Errors (Average %):")
+        print(f"  x-px:    {np.mean([r['err_2d_x'] for r in test_results]):.2f}%")
+        print(f"  y-py:    {np.mean([r['err_2d_y'] for r in test_results]):.2f}%")
+        print(f"  z-pz:    {np.mean([r['err_2d_z'] for r in test_results]):.2f}%")
+        print(f"  4D:      {np.mean(err_4d):.2f}%")
+        print(f"  6D:      {np.mean(err_6d):.2f}%")
     else:
         print("\n⚠ WARNING: No samples were successfully evaluated!")
 
@@ -1241,7 +1341,7 @@ def evaluate_model(flow_model, test_dataset, scaler_final, scaler_condition, con
 # SAVE MODEL
 # ============================================================================
 
-def save_model(flow_model, scaler_final, scaler_condition, train_losses, test_losses, 
+def save_model(flow_model, scaler_final, scaler_condition, history, 
                best_test_loss, best_epoch, pt_files, train_dataset, test_dataset, config):
     """Save model and scalers."""
     print("\n" + "="*80)
@@ -1266,8 +1366,7 @@ def save_model(flow_model, scaler_final, scaler_condition, train_losses, test_lo
             'random_seed': config.RANDOM_SEED
         },
         'training_history': {
-            'train_losses': train_losses,
-            'test_losses': test_losses,
+            'history': history,
             'best_test_loss': best_test_loss,
             'best_epoch': best_epoch
         },
@@ -1290,29 +1389,6 @@ def save_model(flow_model, scaler_final, scaler_condition, train_losses, test_lo
     with open(config.SCALER_SAVE_PATH, 'wb') as f:
         pickle.dump(scalers, f)
     print(f"✓ Scalers saved to: {config.SCALER_SAVE_PATH}")
-    
-    print(f"\n" + "="*80)
-    print("LOADING INSTRUCTIONS")
-    print("="*80)
-    print(f"""
-# Load checkpoint
-checkpoint = torch.load('{config.MODEL_SAVE_PATH}')
-
-# Rebuild model
-from train_norm_flow_conditional import ConditionalFlowModel
-flow_model = ConditionalFlowModel(**checkpoint['model_config'])
-flow_model.load_state_dict(checkpoint['flow_state_dict'])
-
-# Load scalers
-with open('{config.SCALER_SAVE_PATH}', 'rb') as f:
-    scalers = pickle.load(f)
-    scaler_final = scalers['scaler_final']
-    scaler_condition = scalers['scaler_condition']
-
-# Set device and eval mode
-device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-flow_model = flow_model.to(device).eval()
-""")
 
 
 # ============================================================================
@@ -1340,17 +1416,17 @@ def main():
     
     # Update config
     config = Config()
-    config.N_EPOCHS = args.epochs
-    config.BATCH_SIZE = args.batch_size
-    config.LEARNING_RATE = args.lr
-    config.N_FLOW_LAYERS = args.n_layers
-    config.HIDDEN_UNITS = args.hidden_units
-    config.MAX_FILES = args.max_files
-    config.PREPROCESSING_BATCH_SIZE = args.preprocessing_batch_size
-    config.USE_PREPROCESSING = not args.no_preprocess
-    config.WEIGHT_EMITTANCE_2D = args.w_2d
-    config.WEIGHT_EMITTANCE_4D = args.w_4d
-    config.WEIGHT_EMITTANCE_6D = args.w_6d
+    # config.N_EPOCHS = args.epochs
+    # config.BATCH_SIZE = args.batch_size
+    # config.LEARNING_RATE = args.lr
+    # config.N_FLOW_LAYERS = args.n_layers
+    # config.HIDDEN_UNITS = args.hidden_units
+    # config.MAX_FILES = args.max_files
+    # config.PREPROCESSING_BATCH_SIZE = args.preprocessing_batch_size
+    # config.USE_PREPROCESSING = not args.no_preprocess
+    # config.WEIGHT_EMITTANCE_2D = args.w_2d
+    # config.WEIGHT_EMITTANCE_4D = args.w_4d
+    # config.WEIGHT_EMITTANCE_6D = args.w_6d
     
     # Get device
     device = get_device()
