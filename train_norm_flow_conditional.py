@@ -51,6 +51,11 @@ class Config:
     HIDDEN_UNITS = 128
     CONDITION_DIM = 45  # 6 mean + 6 std + 21 cov + 6 skew + 6 kurt
     
+    # Loss weights
+    WEIGHT_EMITTANCE_2D = 0.0
+    WEIGHT_EMITTANCE_4D = 0.0
+    WEIGHT_EMITTANCE_6D = 0.0
+    
     # Validation
     N_SW_PROJECTIONS = 100
     N_SAMPLES_VISUALIZE = 5
@@ -128,6 +133,60 @@ def subsample_particles(particles, n_target):
     
     indices = np.random.choice(n_particles, n_target, replace=False)
     return particles[indices]
+
+
+def compute_emittance_torch(particles):
+    """
+    Compute emittance in PyTorch for a batch of particles.
+    particles: (Batch, N_particles, 6)
+    Assumes particles are in (x, y, z, px, py, pz) order.
+    Returns dictionary with 'x_xp', 'y_yp', 'z_delta', 'fourd', 'sixd' emittances.
+    """
+    # Indices for canonical pairs in (x, y, z, px, py, pz)
+    # x-px: 0, 3
+    # y-py: 1, 4
+    # z-pz: 2, 5
+    
+    # Centering
+    means = particles.mean(dim=1, keepdim=True)
+    centered = particles - means
+    
+    # Covariance matrix: (Batch, 6, 6)
+    # (B, 6, N) @ (B, N, 6) -> (B, 6, 6)
+    cov = torch.bmm(centered.transpose(1, 2), centered) / (particles.shape[1] - 1)
+    
+    emittances = {}
+    
+    # 2D Emittances
+    # eps = sqrt(det(cov_2x2))
+    
+    # x-px (indices 0, 3)
+    cov_x_px = cov[:, [0, 3]][:, :, [0, 3]]
+    det_x_px = torch.linalg.det(cov_x_px)
+    emittances['x_xp'] = torch.sqrt(torch.abs(det_x_px) + 1e-16)
+    
+    # y-py (indices 1, 4)
+    cov_y_py = cov[:, [1, 4]][:, :, [1, 4]]
+    det_y_py = torch.linalg.det(cov_y_py)
+    emittances['y_yp'] = torch.sqrt(torch.abs(det_y_py) + 1e-16)
+    
+    # z-pz (indices 2, 5)
+    cov_z_pz = cov[:, [2, 5]][:, :, [2, 5]]
+    det_z_pz = torch.linalg.det(cov_z_pz)
+    emittances['z_delta'] = torch.sqrt(torch.abs(det_z_pz) + 1e-16)
+    
+    # 4D Emittance (x, px, y, py -> 0, 3, 1, 4)
+    cov_4d = cov[:, [0, 3, 1, 4]][:, :, [0, 3, 1, 4]]
+    det_4d = torch.linalg.det(cov_4d)
+    emittances['fourd'] = torch.sqrt(torch.abs(det_4d) + 1e-16)
+    
+    # 6D Emittance (all)
+    # Canonical order: 0, 3, 1, 4, 2, 5
+    cov_6d = cov[:, [0, 3, 1, 4, 2, 5]][:, :, [0, 3, 1, 4, 2, 5]]
+    det_6d = torch.linalg.det(cov_6d)
+    emittances['sixd'] = torch.sqrt(torch.abs(det_6d) + 1e-16)
+    
+    return emittances
 
 
 # ============================================================================
@@ -744,7 +803,53 @@ def train_model(config, device):
             # Compute negative log-likelihood
             log_prob = flow_model.log_prob(final_flat, cond_flat)
             # Normalize by number of dimensions for interpretable loss values
-            loss = -log_prob.mean() / 6.0
+            nll_loss = -log_prob.mean() / 6.0
+            
+            # ----------------------------------------------------------------
+            # Emittance Loss
+            # ----------------------------------------------------------------
+            loss_emittance = 0.0
+            if config.WEIGHT_EMITTANCE_2D > 0 or config.WEIGHT_EMITTANCE_4D > 0 or config.WEIGHT_EMITTANCE_6D > 0:
+                # Generate samples for emittance calculation
+                # We need to sample from the model using the same conditions
+                # cond_flat is (Batch * N, 45)
+                # We want to generate x_pred matching final_flat structure
+                
+                # Note: flow_model.sample uses torch.randn which is stochastic.
+                # We want gradients to flow through the generated samples to the model parameters.
+                # The reparameterization trick is implicit in the flow transformation (z -> x).
+                
+                x_pred_flat = flow_model.sample(final_flat.size(0), cond_flat)
+                
+                # Reshape to (Batch, N, 6) for emittance calculation
+                x_pred = x_pred_flat.reshape(batch_size, n_particles, 6)
+                x_true = final_batch  # Already (Batch, N, 6) and normalized
+                
+                # Compute emittances (on normalized data)
+                # This keeps the loss magnitude reasonable (O(1))
+                em_pred = compute_emittance_torch(x_pred)
+                em_true = compute_emittance_torch(x_true)
+                
+                if config.WEIGHT_EMITTANCE_2D > 0:
+                    # Percent error: |pred - true| / true
+                    # Add epsilon to denominator for stability
+                    eps = 1e-20
+                    l2d = (torch.abs((em_pred['x_xp'] - em_true['x_xp']) / (em_true['x_xp'] + eps)).mean() +
+                           torch.abs((em_pred['y_yp'] - em_true['y_yp']) / (em_true['y_yp'] + eps)).mean() +
+                           torch.abs((em_pred['z_delta'] - em_true['z_delta']) / (em_true['z_delta'] + eps)).mean()) / 3.0
+                    loss_emittance += config.WEIGHT_EMITTANCE_2D * l2d
+                    
+                if config.WEIGHT_EMITTANCE_4D > 0:
+                    eps = 1e-20
+                    l4d = torch.abs((em_pred['fourd'] - em_true['fourd']) / (em_true['fourd'] + eps)).mean()
+                    loss_emittance += config.WEIGHT_EMITTANCE_4D * l4d
+                    
+                if config.WEIGHT_EMITTANCE_6D > 0:
+                    eps = 1e-20
+                    l6d = torch.abs((em_pred['sixd'] - em_true['sixd']) / (em_true['sixd'] + eps)).mean()
+                    loss_emittance += config.WEIGHT_EMITTANCE_6D * l6d
+            
+            loss = nll_loss + loss_emittance
             
             optimizer.zero_grad()
             loss.backward()
@@ -1226,6 +1331,11 @@ def main():
                         help='Number of files to process at once during preprocessing (lower = less memory)')
     parser.add_argument('--no-preprocess', action='store_true', help='Disable preprocessing')
     
+    # Emittance loss weights
+    parser.add_argument('--w-2d', type=float, default=0.0, help='Weight for 2D emittance loss')
+    parser.add_argument('--w-4d', type=float, default=0.0, help='Weight for 4D emittance loss')
+    parser.add_argument('--w-6d', type=float, default=0.0, help='Weight for 6D emittance loss')
+    
     args = parser.parse_args()
     
     # Update config
@@ -1238,6 +1348,9 @@ def main():
     config.MAX_FILES = args.max_files
     config.PREPROCESSING_BATCH_SIZE = args.preprocessing_batch_size
     config.USE_PREPROCESSING = not args.no_preprocess
+    config.WEIGHT_EMITTANCE_2D = args.w_2d
+    config.WEIGHT_EMITTANCE_4D = args.w_4d
+    config.WEIGHT_EMITTANCE_6D = args.w_6d
     
     # Get device
     device = get_device()
