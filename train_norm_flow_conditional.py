@@ -26,27 +26,27 @@ warnings.filterwarnings('ignore')
 
 class Config:
     # File paths
-    DATA_DIR = "../particle_data"
+    DATA_DIR = "../graph_surrogate_shared/particles_data/Archive_4"
     MODEL_SAVE_PATH = "conditional_flow_model.pt"
     SCALER_SAVE_PATH = "conditional_flow_scalers.pkl"
     
     # Preprocessing
-    PREPROCESSED_DIR = "preprocessed_particles"
+    PREPROCESSED_DIR = "preprocessed_stats"
     USE_PREPROCESSING = True
-    PREPROCESSING_BATCH_SIZE = 50  # Process this many files at a time to avoid OOM
-    
+    PREPROCESSING_BATCH_SIZE = 5000  # Process this many files at a time to avoid OOM
+
     # Data loading
-    BATCH_SIZE = 16
-    NUM_WORKERS = 4
+    BATCH_SIZE = 32
+    NUM_WORKERS = 16
     PREFETCH_FACTOR = 2
-    N_PARTICLES_PER_SAMPLE = 1000
-    MAX_FILES = None  # Set to None to use all files
-    
+    N_PARTICLES_PER_SAMPLE = 2000
+    MAX_FILES = None  # Set to None to use all files, or a number for testing (e.g., 100)
+
     # Training
     TRAIN_TEST_SPLIT = 0.2
     RANDOM_SEED = 42
     LEARNING_RATE = 1e-4
-    N_EPOCHS = 50
+    N_EPOCHS = 250
     WEIGHT_DECAY = 1e-5
     
     # Flow architecture
@@ -617,7 +617,7 @@ def compute_normalization(train_dataset, final_all, cond_all, config):
         train_cond = cond_all[train_indices]
         
         # Use subset for efficiency
-        n_norm = min(100000, len(train_final_flat))
+        n_norm = min(1000000, len(train_final_flat))
         norm_idx_final = np.random.choice(len(train_final_flat), n_norm, replace=False)
         
         scaler_final = StandardScaler()
@@ -1396,23 +1396,23 @@ def save_model(flow_model, scaler_final, scaler_condition, history,
 # ============================================================================
 
 def main():
-    parser = argparse.ArgumentParser(description='Train conditional normalizing flow model')
-    parser.add_argument('--epochs', type=int, default=50, help='Number of epochs')
-    parser.add_argument('--batch-size', type=int, default=16, help='Batch size')
-    parser.add_argument('--lr', type=float, default=1e-4, help='Learning rate')
-    parser.add_argument('--n-layers', type=int, default=8, help='Number of flow layers')
-    parser.add_argument('--hidden-units', type=int, default=128, help='Hidden units')
-    parser.add_argument('--max-files', type=int, default=None, help='Max files to use')
-    parser.add_argument('--preprocessing-batch-size', type=int, default=50, 
-                        help='Number of files to process at once during preprocessing (lower = less memory)')
-    parser.add_argument('--no-preprocess', action='store_true', help='Disable preprocessing')
+    # parser = argparse.ArgumentParser(description='Train conditional normalizing flow model')
+    # parser.add_argument('--epochs', type=int, default=50, help='Number of epochs')
+    # parser.add_argument('--batch-size', type=int, default=16, help='Batch size')
+    # parser.add_argument('--lr', type=float, default=1e-4, help='Learning rate')
+    # parser.add_argument('--n-layers', type=int, default=8, help='Number of flow layers')
+    # parser.add_argument('--hidden-units', type=int, default=128, help='Hidden units')
+    # parser.add_argument('--max-files', type=int, default=None, help='Max files to use')
+    # parser.add_argument('--preprocessing-batch-size', type=int, default=50, 
+    #                     help='Number of files to process at once during preprocessing (lower = less memory)')
+    # parser.add_argument('--no-preprocess', action='store_true', help='Disable preprocessing')
     
-    # Emittance loss weights
-    parser.add_argument('--w-2d', type=float, default=0.0, help='Weight for 2D emittance loss')
-    parser.add_argument('--w-4d', type=float, default=0.0, help='Weight for 4D emittance loss')
-    parser.add_argument('--w-6d', type=float, default=0.0, help='Weight for 6D emittance loss')
+    # # Emittance loss weights
+    # parser.add_argument('--w-2d', type=float, default=0.0, help='Weight for 2D emittance loss')
+    # parser.add_argument('--w-4d', type=float, default=0.0, help='Weight for 4D emittance loss')
+    # parser.add_argument('--w-6d', type=float, default=0.0, help='Weight for 6D emittance loss')
     
-    args = parser.parse_args()
+    # args = parser.parse_args()
     
     # Update config
     config = Config()
