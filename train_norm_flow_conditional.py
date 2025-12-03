@@ -16,7 +16,6 @@ import pickle
 import warnings
 from tqdm import tqdm
 import gc
-import argparse
 
 warnings.filterwarnings('ignore')
 
@@ -58,6 +57,7 @@ class Config:
     WEIGHT_EMITTANCE_2D = 1.0
     WEIGHT_EMITTANCE_4D = 0.5
     WEIGHT_EMITTANCE_6D = 0.1
+    WEIGHT_BEAM_MATRIX = 0.1  # Weight for beam matrix percent error loss
     
     # Validation
     N_SW_PROJECTIONS = 100
@@ -190,6 +190,30 @@ def compute_emittance_torch(particles):
     emittances['sixd'] = torch.sqrt(torch.abs(det_6d) + 1e-16)
     
     return emittances
+
+
+def compute_beam_matrix_torch(particles):
+    """
+    Compute beam matrix (covariance matrix) in PyTorch for a batch of particles.
+    particles: (Batch, N_particles, 6)
+    Assumes particles are in (x, y, z, px, py, pz) order.
+    Returns: (Batch, 6, 6) covariance matrix in (x, px, y, py, z, pz) order.
+    """
+    # Reorder to (x, px, y, py, z, pz)
+    # Input indices: 0:x, 1:y, 2:z, 3:px, 4:py, 5:pz
+    # Output indices: 0:x, 3:px, 1:y, 4:py, 2:z, 5:pz
+    perm = [0, 3, 1, 4, 2, 5]
+    particles_reordered = particles[:, :, perm]
+    
+    # Use torch.cov for each batch element
+    batch_size = particles.shape[0]
+    cov_list = []
+    
+    for i in range(batch_size):
+        # Transpose to (6, N) as expected by torch.cov
+        cov_list.append(torch.cov(particles_reordered[i].T))
+        
+    return torch.stack(cov_list)
 
 
 # ============================================================================
@@ -771,8 +795,8 @@ def train_model(config, device):
     
     # History storage
     history = {
-        'train': {'total': [], 'nll': [], 'emit_2d': [], 'emit_4d': [], 'emit_6d': []},
-        'test': {'total': [], 'nll': [], 'emit_2d': [], 'emit_4d': [], 'emit_6d': []}
+        'train': {'total': [], 'nll': [], 'emit_2d': [], 'emit_4d': [], 'emit_6d': [], 'beam_matrix': []},
+        'test': {'total': [], 'nll': [], 'emit_2d': [], 'emit_4d': [], 'emit_6d': [], 'beam_matrix': []}
     }
     
     best_test_loss = float('inf')
@@ -793,7 +817,7 @@ def train_model(config, device):
         # Training phase
         flow_model.train()
         
-        epoch_losses = {'total': 0.0, 'nll': 0.0, 'emit_2d': 0.0, 'emit_4d': 0.0, 'emit_6d': 0.0}
+        epoch_losses = {'total': 0.0, 'nll': 0.0, 'emit_2d': 0.0, 'emit_4d': 0.0, 'emit_6d': 0.0, 'beam_matrix': 0.0}
         
         for final_batch, cond_batch in train_loader:
             final_batch = final_batch.to(device)
@@ -821,7 +845,9 @@ def train_model(config, device):
             l4d_val = 0.0
             l6d_val = 0.0
             
-            if config.WEIGHT_EMITTANCE_2D > 0 or config.WEIGHT_EMITTANCE_4D > 0 or config.WEIGHT_EMITTANCE_6D > 0:
+            l_beam_val = 0.0
+            
+            if config.WEIGHT_EMITTANCE_2D > 0 or config.WEIGHT_EMITTANCE_4D > 0 or config.WEIGHT_EMITTANCE_6D > 0 or config.WEIGHT_BEAM_MATRIX > 0:
                 # Generate samples for emittance calculation
                 x_pred_flat = flow_model.sample(final_flat.size(0), cond_flat)
                 
@@ -852,6 +878,17 @@ def train_model(config, device):
                     l6d = torch.abs((em_pred['sixd'] - em_true['sixd']) / (em_true['sixd'] + eps)).mean()
                     loss_emittance += config.WEIGHT_EMITTANCE_6D * l6d
                     l6d_val = l6d.item()
+
+                if config.WEIGHT_BEAM_MATRIX > 0:
+                    cov_pred = compute_beam_matrix_torch(x_pred)
+                    cov_true = compute_beam_matrix_torch(x_true)
+                    
+                    eps = 1e-20
+                    # Element-wise percent error
+                    beam_loss = torch.abs((cov_pred - cov_true) / (torch.abs(cov_true) + eps)).mean()
+                    
+                    loss_emittance += config.WEIGHT_BEAM_MATRIX * beam_loss
+                    l_beam_val = beam_loss.item()
             
             loss = nll_loss + loss_emittance
             
@@ -866,6 +903,7 @@ def train_model(config, device):
             epoch_losses['emit_2d'] += l2d_val * batch_size
             epoch_losses['emit_4d'] += l4d_val * batch_size
             epoch_losses['emit_6d'] += l6d_val * batch_size
+            epoch_losses['beam_matrix'] += l_beam_val * batch_size
         
         # Average over dataset
         for k in epoch_losses:
@@ -876,7 +914,7 @@ def train_model(config, device):
         
         # Evaluation phase
         flow_model.eval()
-        test_epoch_losses = {'total': 0.0, 'nll': 0.0, 'emit_2d': 0.0, 'emit_4d': 0.0, 'emit_6d': 0.0}
+        test_epoch_losses = {'total': 0.0, 'nll': 0.0, 'emit_2d': 0.0, 'emit_4d': 0.0, 'emit_6d': 0.0, 'beam_matrix': 0.0}
         
         with torch.no_grad():
             for final_batch, cond_batch in test_loader:
@@ -898,8 +936,9 @@ def train_model(config, device):
                 l2d_val = 0.0
                 l4d_val = 0.0
                 l6d_val = 0.0
+                l_beam_val = 0.0
                 
-                if config.WEIGHT_EMITTANCE_2D > 0 or config.WEIGHT_EMITTANCE_4D > 0 or config.WEIGHT_EMITTANCE_6D > 0:
+                if config.WEIGHT_EMITTANCE_2D > 0 or config.WEIGHT_EMITTANCE_4D > 0 or config.WEIGHT_EMITTANCE_6D > 0 or config.WEIGHT_BEAM_MATRIX > 0:
                     x_pred_flat = flow_model.sample(final_flat.size(0), cond_flat)
                     x_pred = x_pred_flat.reshape(batch_size, n_particles, 6)
                     x_true = final_batch
@@ -926,6 +965,17 @@ def train_model(config, device):
                         l6d = torch.abs((em_pred['sixd'] - em_true['sixd']) / (em_true['sixd'] + eps)).mean()
                         loss_emittance += config.WEIGHT_EMITTANCE_6D * l6d
                         l6d_val = l6d.item()
+
+                    if config.WEIGHT_BEAM_MATRIX > 0:
+                        cov_pred = compute_beam_matrix_torch(x_pred)
+                        cov_true = compute_beam_matrix_torch(x_true)
+                        
+                        eps = 1e-20
+                        # Element-wise percent error
+                        beam_loss = torch.abs((cov_pred - cov_true) / (torch.abs(cov_true) + eps)).mean()
+                        
+                        loss_emittance += config.WEIGHT_BEAM_MATRIX * beam_loss
+                        l_beam_val = beam_loss.item()
                 
                 loss = nll_loss + loss_emittance
                 
@@ -934,6 +984,7 @@ def train_model(config, device):
                 test_epoch_losses['emit_2d'] += l2d_val * batch_size
                 test_epoch_losses['emit_4d'] += l4d_val * batch_size
                 test_epoch_losses['emit_6d'] += l6d_val * batch_size
+                test_epoch_losses['beam_matrix'] += l_beam_val * batch_size
         
         for k in test_epoch_losses:
             test_epoch_losses[k] /= len(test_dataset)
@@ -1026,7 +1077,9 @@ def plot_training_history(history, best_test_loss, best_epoch):
         axes[1].plot(epochs, history['train']['emit_4d'], alpha=0.6, label='Emit 4D (weighted)', linestyle='--')
     if any(v > 0 for v in history['train']['emit_6d']):
         axes[1].plot(epochs, history['train']['emit_6d'], alpha=0.6, label='Emit 6D (weighted)', linestyle='--')
-        
+    if any(v > 0 for v in history['train']['beam_matrix']):
+        axes[1].plot(epochs, history['train']['beam_matrix'], alpha=0.6, label='Beam Matrix (weighted)', linestyle='--')
+    
     axes[1].set_xlabel('Epoch', fontsize=12)
     axes[1].set_ylabel('Loss Component', fontsize=12)
     axes[1].set_title('Training Loss Breakdown', fontsize=14, fontweight='bold')
@@ -1203,6 +1256,78 @@ def plot_evaluation_results(result, idx):
     plt.tight_layout()
     plt.savefig(f'conditional_flow_evaluation_{idx}_pz.png', dpi=150, bbox_inches='tight')
     print(f"  ✓ Saved Pz distribution plot to: conditional_flow_evaluation_{idx}_pz.png")
+    plt.close()
+
+    # Plot Beam Matrix Comparison
+    fig_cov, axes_cov = plt.subplots(1, 3, figsize=(18, 5))
+    
+    # Reorder to canonical (x, px, y, py, z, pz)
+    perm = [0, 3, 1, 4, 2, 5]
+    true_reordered = true_final[:, perm]
+    pred_reordered = pred_final[:, perm]
+    
+    # Compute covariance matrices
+    cov_true = np.cov(true_reordered.T)
+    cov_pred = np.cov(pred_reordered.T)
+    
+    # Calculate percent error matrix
+    eps = 1e-20
+    cov_error = 100 * np.abs((cov_pred - cov_true) / (np.abs(cov_true) + eps))
+    
+    # Labels
+    labels = ['x', 'px', 'y', 'py', 'z', 'pz']
+    
+    # Plot True
+    im0 = axes_cov[0].imshow(cov_true, cmap='viridis')
+    axes_cov[0].set_title('True Beam Matrix', fontsize=14)
+    axes_cov[0].set_xticks(range(6))
+    axes_cov[0].set_yticks(range(6))
+    axes_cov[0].set_xticklabels(labels)
+    axes_cov[0].set_yticklabels(labels)
+    plt.colorbar(im0, ax=axes_cov[0])
+    
+    # Annotate True
+    for i in range(6):
+        for j in range(6):
+            text = axes_cov[0].text(j, i, f"{cov_true[i, j]:.1e}",
+                                   ha="center", va="center", color="w", fontsize=8)
+    
+    # Plot Predicted
+    im1 = axes_cov[1].imshow(cov_pred, cmap='viridis')
+    axes_cov[1].set_title('Predicted Beam Matrix', fontsize=14)
+    axes_cov[1].set_xticks(range(6))
+    axes_cov[1].set_yticks(range(6))
+    axes_cov[1].set_xticklabels(labels)
+    axes_cov[1].set_yticklabels(labels)
+    plt.colorbar(im1, ax=axes_cov[1])
+    
+    # Annotate Predicted
+    for i in range(6):
+        for j in range(6):
+            text = axes_cov[1].text(j, i, f"{cov_pred[i, j]:.1e}",
+                                   ha="center", va="center", color="w", fontsize=8)
+    
+    # Plot Error
+    im2 = axes_cov[2].imshow(cov_error, cmap='Reds', vmin=0, vmax=100)
+    axes_cov[2].set_title('Percent Error (%)', fontsize=14)
+    axes_cov[2].set_xticks(range(6))
+    axes_cov[2].set_yticks(range(6))
+    axes_cov[2].set_xticklabels(labels)
+    axes_cov[2].set_yticklabels(labels)
+    plt.colorbar(im2, ax=axes_cov[2])
+    
+    # Annotate Error
+    for i in range(6):
+        for j in range(6):
+            val = cov_error[i, j]
+            color = "white" if val > 50 else "black"
+            text = axes_cov[2].text(j, i, f"{val:.1f}",
+                                   ha="center", va="center", color=color, fontsize=8)
+    
+    plt.suptitle(f'Beam Matrix Comparison - Sample {idx}', fontsize=16, fontweight='bold')
+    plt.tight_layout()
+    plt.savefig(f'conditional_flow_evaluation_{idx}_beam_matrix.png', dpi=150, bbox_inches='tight')
+    print(f"  ✓ Saved Beam Matrix plot to: conditional_flow_evaluation_{idx}_beam_matrix.png")
     plt.close()
 
 
@@ -1396,37 +1521,7 @@ def save_model(flow_model, scaler_final, scaler_condition, history,
 # ============================================================================
 
 def main():
-    # parser = argparse.ArgumentParser(description='Train conditional normalizing flow model')
-    # parser.add_argument('--epochs', type=int, default=50, help='Number of epochs')
-    # parser.add_argument('--batch-size', type=int, default=16, help='Batch size')
-    # parser.add_argument('--lr', type=float, default=1e-4, help='Learning rate')
-    # parser.add_argument('--n-layers', type=int, default=8, help='Number of flow layers')
-    # parser.add_argument('--hidden-units', type=int, default=128, help='Hidden units')
-    # parser.add_argument('--max-files', type=int, default=None, help='Max files to use')
-    # parser.add_argument('--preprocessing-batch-size', type=int, default=50, 
-    #                     help='Number of files to process at once during preprocessing (lower = less memory)')
-    # parser.add_argument('--no-preprocess', action='store_true', help='Disable preprocessing')
-    
-    # # Emittance loss weights
-    # parser.add_argument('--w-2d', type=float, default=0.0, help='Weight for 2D emittance loss')
-    # parser.add_argument('--w-4d', type=float, default=0.0, help='Weight for 4D emittance loss')
-    # parser.add_argument('--w-6d', type=float, default=0.0, help='Weight for 6D emittance loss')
-    
-    # args = parser.parse_args()
-    
-    # Update config
     config = Config()
-    # config.N_EPOCHS = args.epochs
-    # config.BATCH_SIZE = args.batch_size
-    # config.LEARNING_RATE = args.lr
-    # config.N_FLOW_LAYERS = args.n_layers
-    # config.HIDDEN_UNITS = args.hidden_units
-    # config.MAX_FILES = args.max_files
-    # config.PREPROCESSING_BATCH_SIZE = args.preprocessing_batch_size
-    # config.USE_PREPROCESSING = not args.no_preprocess
-    # config.WEIGHT_EMITTANCE_2D = args.w_2d
-    # config.WEIGHT_EMITTANCE_4D = args.w_4d
-    # config.WEIGHT_EMITTANCE_6D = args.w_6d
     
     # Get device
     device = get_device()
