@@ -61,7 +61,8 @@ class Config:
     WEIGHT_EMITTANCE_2D = 1.0
     WEIGHT_EMITTANCE_4D = 0.5
     WEIGHT_EMITTANCE_6D = 0.1
-    WEIGHT_BEAM_MATRIX = 0.1  # Weight for beam matrix percent error loss
+    WEIGHT_BEAM_MATRIX = 0.005  # Weight for beam matrix percent error loss
+    BEAM_MATRIX_REGULARIZATION = 1e-2 # Regularization term for beam matrix SMAPE denominator
     
     # Validation
     N_SW_PROJECTIONS = 100
@@ -980,9 +981,9 @@ def train_model(config, device):
                     cov_pred = compute_beam_matrix_torch(x_pred)
                     cov_true = compute_beam_matrix_torch(x_true)
                     
-                    eps = 1e-20
-                    # Element-wise percent error
-                    beam_loss = torch.abs((cov_pred - cov_true) / (torch.abs(cov_true) + eps)).mean()
+                    # Symmetric MAPE with regularization
+                    beam_loss = (2 * torch.abs(cov_pred - cov_true) /
+                                 (torch.abs(cov_pred) + torch.abs(cov_true) + config.BEAM_MATRIX_REGULARIZATION)).mean()
                     
                     loss_emittance += config.WEIGHT_BEAM_MATRIX * beam_loss
                     l_beam_val = beam_loss.item()
@@ -1067,9 +1068,9 @@ def train_model(config, device):
                         cov_pred = compute_beam_matrix_torch(x_pred)
                         cov_true = compute_beam_matrix_torch(x_true)
                         
-                        eps = 1e-20
-                        # Element-wise percent error
-                        beam_loss = torch.abs((cov_pred - cov_true) / (torch.abs(cov_true) + eps)).mean()
+                        # Symmetric MAPE with regularization
+                        beam_loss = (2 * torch.abs(cov_pred - cov_true) /
+                                     (torch.abs(cov_pred) + torch.abs(cov_true) + config.BEAM_MATRIX_REGULARIZATION)).mean()
                         
                         loss_emittance += config.WEIGHT_BEAM_MATRIX * beam_loss
                         l_beam_val = beam_loss.item()
