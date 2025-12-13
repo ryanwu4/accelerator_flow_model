@@ -309,8 +309,9 @@ class NormalizedFlowDataset(Dataset):
 
 def rational_quadratic_spline(inputs, widths, heights, derivatives, inverse=False,
                                tail_bound=3.0, min_bin_width=1e-3,
-                               min_bin_height=1e-3, min_derivative=1e-3):
-    """Monotonic rational quadratic spline for elementwise transforms."""
+                               min_bin_height=1e-3, min_derivative=1e-3,
+                               max_derivative=10.0, eps=1e-6):
+    """Monotonic rational quadratic spline for elementwise transforms with small eps for stability."""
     num_bins = widths.shape[-1]
     left, right = -tail_bound, tail_bound
     bottom, top = -tail_bound, tail_bound
@@ -330,6 +331,7 @@ def rational_quadratic_spline(inputs, widths, heights, derivatives, inverse=Fals
     heights = cumheights[..., 1:] - cumheights[..., :-1]
 
     derivatives = F.softplus(derivatives) + min_derivative
+    derivatives = torch.clamp(derivatives, max=max_derivative)
 
     inside_interval = (inputs >= left) & (inputs <= right)
     outputs = inputs.clone()
@@ -345,6 +347,7 @@ def rational_quadratic_spline(inputs, widths, heights, derivatives, inverse=Fals
         output_cumheights = cumheights.gather(-1, bin_idx.unsqueeze(-1)).squeeze(-1)
         output_bin_heights = heights.gather(-1, bin_idx.unsqueeze(-1)).squeeze(-1)
 
+        input_bin_widths = torch.clamp(input_bin_widths, min=eps)
         delta = output_bin_heights / input_bin_widths
 
         derivative_left = derivatives[..., :-1].gather(-1, bin_idx.unsqueeze(-1)).squeeze(-1)
@@ -355,20 +358,25 @@ def rational_quadratic_spline(inputs, widths, heights, derivatives, inverse=Fals
         b = output_bin_heights * delta
         c = - (inputs - output_cumheights) * delta
 
-        discriminant = b.pow(2) - 4 * a * c
-        discriminant = torch.clamp(discriminant, min=0.0)
-        root = (2 * c) / (-b - torch.sqrt(discriminant))
+        discriminant = torch.clamp(b.pow(2) - 4 * a * c, min=0.0)
+        sqrt_disc = torch.sqrt(discriminant)
+        denom = -b - torch.sign(b) * sqrt_disc
+        denom = torch.where(denom == 0, denom + eps, denom)
+        root = (2 * c) / denom
         root = torch.clamp(root, 0.0, 1.0)
 
         outputs_inside = root * input_bin_widths + input_cumwidths
 
         denominator = delta + (derivative_left + derivative_right - 2 * delta) * root * (1 - root)
+        denominator = torch.clamp(denominator, min=eps)
         derivative_numerator = delta.pow(2) * (
             derivative_right * root.pow(2)
             + 2 * delta * root * (1 - root)
             + derivative_left * (1 - root).pow(2)
         )
         derivative_denominator = denominator.pow(2)
+        derivative_numerator = torch.clamp(derivative_numerator, min=eps)
+        derivative_denominator = torch.clamp(derivative_denominator, min=eps)
         logabsdet_forward = torch.log(derivative_numerator) - torch.log(derivative_denominator) - torch.log(input_bin_widths)
 
         outputs = torch.where(inside_interval, outputs_inside, outputs)
@@ -384,6 +392,7 @@ def rational_quadratic_spline(inputs, widths, heights, derivatives, inverse=Fals
         output_cumheights = cumheights.gather(-1, bin_idx.unsqueeze(-1)).squeeze(-1)
         output_bin_heights = heights.gather(-1, bin_idx.unsqueeze(-1)).squeeze(-1)
 
+        input_bin_widths = torch.clamp(input_bin_widths, min=eps)
         delta = output_bin_heights / input_bin_widths
 
         derivative_left = derivatives[..., :-1].gather(-1, bin_idx.unsqueeze(-1)).squeeze(-1)
@@ -394,6 +403,7 @@ def rational_quadratic_spline(inputs, widths, heights, derivatives, inverse=Fals
 
         numerator = output_bin_heights * (delta * theta.pow(2) + derivative_left * theta_one_minus_theta)
         denominator = delta + (derivative_left + derivative_right - 2 * delta) * theta_one_minus_theta
+        denominator = torch.clamp(denominator, min=eps)
 
         outputs_inside = output_cumheights + numerator / denominator
 
@@ -401,10 +411,17 @@ def rational_quadratic_spline(inputs, widths, heights, derivatives, inverse=Fals
             derivative_right * theta.pow(2) + 2 * delta * theta_one_minus_theta + derivative_left * (1 - theta).pow(2)
         )
         derivative_denominator = denominator.pow(2)
+        derivative_numerator = torch.clamp(derivative_numerator, min=eps)
+        derivative_denominator = torch.clamp(derivative_denominator, min=eps)
+        input_bin_widths = torch.clamp(input_bin_widths, min=eps)
         logabsdet_inside = torch.log(derivative_numerator) - torch.log(derivative_denominator) - torch.log(input_bin_widths)
 
         outputs = torch.where(inside_interval, outputs_inside, outputs)
         logabsdet = torch.where(inside_interval, logabsdet_inside, logabsdet)
+
+    # Final safety: remove any lingering non-finite values to prevent cascading NaNs
+    outputs = torch.nan_to_num(outputs, nan=0.0, posinf=tail_bound, neginf=-tail_bound)
+    logabsdet = torch.nan_to_num(logabsdet, nan=0.0, posinf=0.0, neginf=0.0)
 
     return outputs, logabsdet
 
@@ -766,7 +783,7 @@ def compute_normalization(train_dataset, final_all, cond_all, config):
         scaler_final = StandardScaler()
         scaler_final.fit(final_array)
         scaler_final.scale_ = np.maximum(scaler_final.scale_, 1e-3)
-        
+
         scaler_condition = StandardScaler()
         scaler_condition.fit(cond_array)
         
