@@ -934,7 +934,7 @@ def train_model(config, device):
         
         epoch_losses = {'total': 0.0, 'nll': 0.0, 'emit_2d': 0.0, 'emit_4d': 0.0, 'emit_6d': 0.0, 'beam_matrix': 0.0}
         
-        for final_batch, cond_batch in train_loader:
+        for step, (final_batch, cond_batch) in enumerate(train_loader):
             final_batch = final_batch.to(device)
             cond_batch = cond_batch.to(device)
             
@@ -1006,11 +1006,53 @@ def train_model(config, device):
                     l_beam_val = beam_loss.item()
             
             loss = nll_loss + loss_emittance
-            
+
             optimizer.zero_grad()
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(flow_model.parameters(), max_norm=1.0)
+
+            # Sanitize gradients in-place to remove NaN/Inf and clamp magnitude
+            grad_was_nonfinite = False
+            for name, param in flow_model.named_parameters():
+                if param.grad is None:
+                    continue
+                if not torch.isfinite(param.grad).all():
+                    grad_was_nonfinite = True
+                    param.grad = torch.nan_to_num(param.grad, nan=0.0, posinf=0.0, neginf=0.0)
+                param.grad.data.clamp_(-100.0, 100.0)
+            if grad_was_nonfinite:
+                cond_min = cond_flat.min().item()
+                cond_max = cond_flat.max().item()
+                final_min = final_flat.min().item()
+                final_max = final_flat.max().item()
+                print(f"Grad had non-finite values; sanitized and clamped at epoch {epoch} step {step} | cond_min={cond_min:.3e}, cond_max={cond_max:.3e}, final_min={final_min:.3e}, final_max={final_max:.3e}")
+
+            # Detect any remaining non-finite gradients before clipping/step
+            grad_is_finite = True
+            for name, param in flow_model.named_parameters():
+                if param.grad is None:
+                    continue
+                if not torch.isfinite(param.grad).all():
+                    grad_is_finite = False
+                    g = param.grad
+                    g_nonfinite = g[~torch.isfinite(g)]
+                    g_min = g_nonfinite.min().item() if g_nonfinite.numel() > 0 else float('nan')
+                    g_max = g_nonfinite.max().item() if g_nonfinite.numel() > 0 else float('nan')
+                    cond_min = cond_flat.min().item()
+                    cond_max = cond_flat.max().item()
+                    final_min = final_flat.min().item()
+                    final_max = final_flat.max().item()
+                    print(f"Non-finite grad at epoch {epoch} step {step} in {name}: min={g_min:.3e}, max={g_max:.3e} | cond_min={cond_min:.3e}, cond_max={cond_max:.3e}, final_min={final_min:.3e}, final_max={final_max:.3e}")
+                    break
+            if not grad_is_finite:
+                optimizer.zero_grad()
+                continue
+
+            total_norm = torch.nn.utils.clip_grad_norm_(flow_model.parameters(), max_norm=1.0)
             optimizer.step()
+            
+            # Log gradient norm occasionally
+            if step % 100 == 0:  # or epoch-level
+                print(f"grad_norm={total_norm.item():.2f} (clipped at 1.0)")
             
             # Accumulate losses
             epoch_losses['total'] += loss.item() * batch_size
