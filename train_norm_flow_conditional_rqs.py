@@ -17,6 +17,7 @@ import pickle
 import warnings
 from tqdm import tqdm
 import gc
+import normflows as nf
 
 warnings.filterwarnings('ignore')
 
@@ -51,10 +52,10 @@ class Config:
     WEIGHT_DECAY = 1e-5
     
     # Flow architecture
-    N_FLOW_LAYERS = 8
+    N_FLOW_LAYERS = 3
     HIDDEN_UNITS = 128
     CONDITION_DIM = 45  # 6 mean + 6 std + 21 cov + 6 skew + 6 kurt
-    RQS_N_BINS = 8
+    RQS_N_BINS = 24
     RQS_TAIL_BOUND = 3.0
     
     # Loss weights
@@ -306,196 +307,43 @@ class NormalizedFlowDataset(Dataset):
 # MODEL ARCHITECTURE
 # ============================================================================
 
-
-def rational_quadratic_spline(inputs, widths, heights, derivatives, inverse=False,
-                               tail_bound=3.0, min_bin_width=1e-3,
-                               min_bin_height=1e-3, min_derivative=1e-3,
-                               max_derivative=10.0, eps=1e-6):
-    """Monotonic rational quadratic spline for elementwise transforms with small eps for stability."""
-    num_bins = widths.shape[-1]
-    left, right = -tail_bound, tail_bound
-    bottom, top = -tail_bound, tail_bound
-
-    widths = F.softmax(widths, dim=-1)
-    widths = widths * (right - left - min_bin_width * num_bins) + min_bin_width
-    cumwidths = torch.cumsum(widths, dim=-1)
-    cumwidths = F.pad(cumwidths, (1, 0), value=0.0)
-    cumwidths = cumwidths + left
-    widths = cumwidths[..., 1:] - cumwidths[..., :-1]
-
-    heights = F.softmax(heights, dim=-1)
-    heights = heights * (top - bottom - min_bin_height * num_bins) + min_bin_height
-    cumheights = torch.cumsum(heights, dim=-1)
-    cumheights = F.pad(cumheights, (1, 0), value=0.0)
-    cumheights = cumheights + bottom
-    heights = cumheights[..., 1:] - cumheights[..., :-1]
-
-    derivatives = F.softplus(derivatives) + min_derivative
-    derivatives = torch.clamp(derivatives, max=max_derivative)
-
-    inside_interval = (inputs >= left) & (inputs <= right)
-    outputs = inputs.clone()
-    logabsdet = torch.zeros_like(inputs)
-
-    if inverse:
-        inputs = torch.clamp(inputs, bottom, top)
-        bin_idx = torch.sum(inputs[..., None] >= cumheights[..., 1:], dim=-1)
-        bin_idx = torch.clamp(bin_idx, max=num_bins - 1)
-
-        input_cumwidths = cumwidths.gather(-1, bin_idx.unsqueeze(-1)).squeeze(-1)
-        input_bin_widths = widths.gather(-1, bin_idx.unsqueeze(-1)).squeeze(-1)
-        output_cumheights = cumheights.gather(-1, bin_idx.unsqueeze(-1)).squeeze(-1)
-        output_bin_heights = heights.gather(-1, bin_idx.unsqueeze(-1)).squeeze(-1)
-
-        input_bin_widths = torch.clamp(input_bin_widths, min=eps)
-        delta = output_bin_heights / input_bin_widths
-
-        derivative_left = derivatives[..., :-1].gather(-1, bin_idx.unsqueeze(-1)).squeeze(-1)
-        derivative_right = derivatives[..., 1:].gather(-1, bin_idx.unsqueeze(-1)).squeeze(-1)
-
-        # Quadratic coefficients for solving spline inverse
-        a = (inputs - output_cumheights) * (derivative_left + derivative_right - 2 * delta) + output_bin_heights * (delta - derivative_left)
-        b = output_bin_heights * delta
-        c = - (inputs - output_cumheights) * delta
-
-        discriminant = torch.clamp(b.pow(2) - 4 * a * c, min=0.0)
-        sqrt_disc = torch.sqrt(discriminant)
-        denom = -b - torch.sign(b) * sqrt_disc
-        denom = torch.where(denom == 0, denom + eps, denom)
-        root = (2 * c) / denom
-        root = torch.clamp(root, 0.0, 1.0)
-
-        outputs_inside = root * input_bin_widths + input_cumwidths
-
-        denominator = delta + (derivative_left + derivative_right - 2 * delta) * root * (1 - root)
-        denominator = torch.clamp(denominator, min=eps)
-        derivative_numerator = delta.pow(2) * (
-            derivative_right * root.pow(2)
-            + 2 * delta * root * (1 - root)
-            + derivative_left * (1 - root).pow(2)
-        )
-        derivative_denominator = denominator.pow(2)
-        derivative_numerator = torch.clamp(derivative_numerator, min=eps)
-        derivative_denominator = torch.clamp(derivative_denominator, min=eps)
-        logabsdet_forward = torch.log(derivative_numerator) - torch.log(derivative_denominator) - torch.log(input_bin_widths)
-
-        outputs = torch.where(inside_interval, outputs_inside, outputs)
-        logabsdet = torch.where(inside_interval, -logabsdet_forward, logabsdet)
-
-    else:
-        inputs = torch.clamp(inputs, left, right)
-        bin_idx = torch.sum(inputs[..., None] >= cumwidths[..., 1:], dim=-1)
-        bin_idx = torch.clamp(bin_idx, max=num_bins - 1)
-
-        input_cumwidths = cumwidths.gather(-1, bin_idx.unsqueeze(-1)).squeeze(-1)
-        input_bin_widths = widths.gather(-1, bin_idx.unsqueeze(-1)).squeeze(-1)
-        output_cumheights = cumheights.gather(-1, bin_idx.unsqueeze(-1)).squeeze(-1)
-        output_bin_heights = heights.gather(-1, bin_idx.unsqueeze(-1)).squeeze(-1)
-
-        input_bin_widths = torch.clamp(input_bin_widths, min=eps)
-        delta = output_bin_heights / input_bin_widths
-
-        derivative_left = derivatives[..., :-1].gather(-1, bin_idx.unsqueeze(-1)).squeeze(-1)
-        derivative_right = derivatives[..., 1:].gather(-1, bin_idx.unsqueeze(-1)).squeeze(-1)
-
-        theta = (inputs - input_cumwidths) / input_bin_widths
-        theta_one_minus_theta = theta * (1 - theta)
-
-        numerator = output_bin_heights * (delta * theta.pow(2) + derivative_left * theta_one_minus_theta)
-        denominator = delta + (derivative_left + derivative_right - 2 * delta) * theta_one_minus_theta
-        denominator = torch.clamp(denominator, min=eps)
-
-        outputs_inside = output_cumheights + numerator / denominator
-
-        derivative_numerator = delta.pow(2) * (
-            derivative_right * theta.pow(2) + 2 * delta * theta_one_minus_theta + derivative_left * (1 - theta).pow(2)
-        )
-        derivative_denominator = denominator.pow(2)
-        derivative_numerator = torch.clamp(derivative_numerator, min=eps)
-        derivative_denominator = torch.clamp(derivative_denominator, min=eps)
-        input_bin_widths = torch.clamp(input_bin_widths, min=eps)
-        logabsdet_inside = torch.log(derivative_numerator) - torch.log(derivative_denominator) - torch.log(input_bin_widths)
-
-        outputs = torch.where(inside_interval, outputs_inside, outputs)
-        logabsdet = torch.where(inside_interval, logabsdet_inside, logabsdet)
-
-    # Final safety: remove any lingering non-finite values to prevent cascading NaNs
-    outputs = torch.nan_to_num(outputs, nan=0.0, posinf=tail_bound, neginf=-tail_bound)
-    logabsdet = torch.nan_to_num(logabsdet, nan=0.0, posinf=0.0, neginf=0.0)
-
-    return outputs, logabsdet
-
-
-class ConditionalRQSplineCouplingLayer(nn.Module):
-    """Spline coupling layer with conditioning and alternating masking."""
-    def __init__(self, dim, cond_dim, reverse_mask=False, hidden_dim=128, n_bins=8, tail_bound=3.0):
+class ConditionalSplineFlow(nn.Module):
+    """Wrapper around normflows CoupledRationalQuadraticSpline to support conditioning."""
+    def __init__(self, latent_dim, cond_dim, hidden_dim, n_bins, tail_bound, reverse_mask):
         super().__init__()
-        self.dim = dim
-        self.d = dim // 2
-        self.reverse_mask = reverse_mask
+        self.latent_dim = latent_dim
+        self.cond_dim = cond_dim
         self.n_bins = n_bins
         self.tail_bound = tail_bound
-        self.output_size = (dim - self.d) * (3 * n_bins + 1)
         
-        self.net = nn.Sequential(
-            nn.Linear(self.d + cond_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, self.output_size)
+        # Use normflows CoupledRationalQuadraticSpline
+        # The spline flow expects context as num_context_channels parameter
+        self.spline_flow = nf.flows.CoupledRationalQuadraticSpline(
+            num_input_channels=latent_dim,
+            num_blocks=2,  # Number of residual blocks in the parameter network
+            num_hidden_channels=hidden_dim,
+            num_context_channels=cond_dim,
+            num_bins=n_bins,
+            tails='linear',
+            tail_bound=tail_bound,
+            activation=nn.ReLU,
+            dropout_probability=0.0,
+            reverse_mask=reverse_mask
         )
     
-    def _chunk_params(self, params):
-        params = params.view(params.size(0), self.dim - self.d, 3 * self.n_bins + 1)
-        widths = params[..., :self.n_bins]
-        heights = params[..., self.n_bins:2 * self.n_bins]
-        derivatives = params[..., 2 * self.n_bins:]
-        return widths, heights, derivatives
+    def forward(self, z, context):
+        """Forward: base -> data direction."""
+        return self.spline_flow(z, context=context)
     
-    def forward(self, z, condition):
-        if self.reverse_mask:
-            z1, z2 = z[:, self.d:], z[:, :self.d]
-        else:
-            z1, z2 = z[:, :self.d], z[:, self.d:]
-        
-        params = self.net(torch.cat([z1, condition], dim=1))
-        widths, heights, derivatives = self._chunk_params(params)
-        z2_new, logabsdet = rational_quadratic_spline(
-            z2, widths, heights, derivatives, inverse=False, tail_bound=self.tail_bound
-        )
-        # Clamp logabsdet to prevent extreme log determinants (similar to affine's tanh(scale)*0.5 range)
-        logabsdet = torch.clamp(logabsdet, min=-0.5, max=0.5)
-        log_det = logabsdet.sum(dim=1)
-        
-        if self.reverse_mask:
-            return torch.cat([z2_new, z1], dim=1), log_det
-        else:
-            return torch.cat([z1, z2_new], dim=1), log_det
-    
-    def inverse(self, z, condition):
-        if self.reverse_mask:
-            z1, z2 = z[:, self.d:], z[:, :self.d]
-        else:
-            z1, z2 = z[:, :self.d], z[:, self.d:]
-        
-        params = self.net(torch.cat([z1, condition], dim=1))
-        widths, heights, derivatives = self._chunk_params(params)
-        z2_new, logabsdet = rational_quadratic_spline(
-            z2, widths, heights, derivatives, inverse=True, tail_bound=self.tail_bound
-        )
-        # Clamp logabsdet to prevent extreme log determinants (similar to affine's tanh(scale)*0.5 range)
-        logabsdet = torch.clamp(logabsdet, min=-0.5, max=0.5)
-        log_det = logabsdet.sum(dim=1)
-        
-        if self.reverse_mask:
-            return torch.cat([z2_new, z1], dim=1), log_det
-        else:
-            return torch.cat([z1, z2_new], dim=1), log_det
+    def inverse(self, z, context):
+        """Inverse: data -> base direction."""
+        return self.spline_flow.inverse(z, context=context)
 
 
 class ConditionalFlowModel(nn.Module):
     """
     Conditional flow with RQ-spline coupling: transforms N(0,I) → final distribution.
+    Uses normflows CoupledRationalQuadraticSpline implementation.
     """
     def __init__(self, latent_dim=6, condition_dim=45, hidden_dim=128, n_layers=8, n_bins=8, tail_bound=3.0):
         super().__init__()
@@ -510,17 +358,18 @@ class ConditionalFlowModel(nn.Module):
             nn.Linear(hidden_dim, hidden_dim)
         )
         
+        # Build flow layers using normflows
         self.flows = nn.ModuleList()
         for i in range(n_layers):
             reverse_mask = (i % 2 == 1)
             self.flows.append(
-                ConditionalRQSplineCouplingLayer(
-                    latent_dim,
-                    hidden_dim,
-                    reverse_mask=reverse_mask,
+                ConditionalSplineFlow(
+                    latent_dim=latent_dim,
+                    cond_dim=hidden_dim,
                     hidden_dim=hidden_dim,
                     n_bins=n_bins,
                     tail_bound=tail_bound,
+                    reverse_mask=reverse_mask
                 )
             )
         
@@ -550,6 +399,9 @@ class ConditionalFlowModel(nn.Module):
         return log_prob_base + log_det
     
     def sample(self, n_samples, condition):
+        # Expand condition to match n_samples if needed
+        if condition.shape[0] == 1 and n_samples > 1:
+            condition = condition.expand(n_samples, -1)
         z = torch.randn(n_samples, self.latent_dim, device=condition.device)
         x, _ = self.forward(z, condition)
         return x
