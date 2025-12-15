@@ -461,7 +461,7 @@ class ConditionalRQSplineCouplingLayer(nn.Module):
         params = self.net(torch.cat([z1, condition], dim=1))
         widths, heights, derivatives = self._chunk_params(params)
         z2_new, logabsdet = rational_quadratic_spline(
-            z2, widths, heights, derivatives, inverse=False, tail_bound=self.tail_bound
+            z2, widths, heights, derivatives, inverse=True, tail_bound=self.tail_bound
         )
         log_det = logabsdet.sum(dim=1)
         
@@ -479,7 +479,7 @@ class ConditionalRQSplineCouplingLayer(nn.Module):
         params = self.net(torch.cat([z1, condition], dim=1))
         widths, heights, derivatives = self._chunk_params(params)
         z2_new, logabsdet = rational_quadratic_spline(
-            z2, widths, heights, derivatives, inverse=True, tail_bound=self.tail_bound
+            z2, widths, heights, derivatives, inverse=False, tail_bound=self.tail_bound
         )
         log_det = logabsdet.sum(dim=1)
         
